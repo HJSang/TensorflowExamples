@@ -167,6 +167,95 @@ Tracing with Tensor("a:0", shape=(), dtype=string)
 tf.Tensor(b'aa', shape=(), dtype=string)
 ```
 * Create a new tf.function. Separate tf.function objects are guaranteed not to share traces
+* Python or Tensor args?
+  * Python arguments are often used to control hyperparameters and graph constructions - for example, ``num_layers=10``. So if the Python argument changes, it makes sense that you'd have to rerace the graph.
+  * However, it's possible that a Python argument is not being used to control graph construction. In these cases, a change in the Python value can trigger needless retracing. Take, for example, this training loop, which AUtoGraph will dynamically unroll. Despite the multiple traces, the generated graph is actually identical, so this is a bit inefficient.
+  ```python
+  def train_one_step():
+    pass
+  @tf.function
+  def train(num_steps):
+    print("Tracing with num_steps = {}".format(num_steps))
+    for _ in tf.range(num_steps):
+      train_one_step()
+  train(num_steps=10)
+  train(num_steps=20)
+  ```
+  * The simple workaround here is to cast your arguments to Tensors if they do not affect the shape of the generated graph.
+  ```python
+  train(num_steps=tf.constant(10))
+  train(num_steps=tf.constant(20))
+  ```
+* Side effects in ``tf.function``
+  * The general rule of thumb is to only use Python side effects to debug your traces.
+  * Otherwise, TensorFlow ops like tf.Variable.assign, tf.print, and tf.summary are the best way to ensure your code will be traced and executed by the TensorFlow runtime with each call
+  * In general using a functional style will yield the best results.
+  ```python
+  @tf.function
+  def f(x):
+    print("Traced with", x)
+    tf.print("Executed with", x)
+  f(1)
+  f(1)
+  f(2)
+  ```
+  ```
+  Traced with 1
+  Executed with 1
+  Executed with 1
+  Traced with 2
+  Executed with 2
+  ```
+  * In general, while these constructs work as expected in Eager mode, many unexpected things can happen inside a tf.function due to tracing behavior
+  * To give one example, advancing iterator state is a Python side effect and therefore only happens during tracing
+  ```python
+  external_var = tf.Variable(0)
+  @tf.function
+  def buggy_consume_next(iterator):
+    extenal_var.assign_add(next(iterator))
+    tf.print("Value of external_var:", external_var)
+  
+  iterator = iter([0,1,2,3])
+  buggy_consume_next(iterator)
+  # This reuses the first value from the iterator, rather than consuming the next value
+  buggy_consume_next(iterator)
+  buggy_consume_next(iterator)
+  ```
+  ```
+  Value of external_var: 0
+  Value of external_var: 0
+  Value of external_var: 0
+  ```
+* Variables
+  * We can use the same idea of leveraging the intended execution order of the code to make variable creation and utilization very easy in tf.function. There is one very important caveat, though, which is that with variables it's possible to write code which behaves differently in eager mode and graph mode.
+  * Specifically, this will happen when you create a new Variable with each call. Due to tracing semantics, tf.function will reuse the same variable each call, but eager mode will create a new variable with each call. To guard against this mistake, tf.function will raise an error if it detects dangerous variable creation behavior.
+  ```python
+  @tf.function
+  def f(x):
+    v = tf.Variable(1.0)
+    v.assign_add(x)
+    return v
+
+  with assert_raises(ValueError):
+    f(1.0)
+  ```
+  ```python
+  v = tf.Variable(1.0)
+
+  @tf.function
+  def f(x):
+    return v.assign_add(x)
+
+  print(f(1.0))  # 2.0
+  print(f(2.0))  # 4.0
+  ```
+
+* AutoGraph Transformations
+  * AutoGraph is a library that is on by default in tf.function, and transforms a subset of Python Eager code into graph-compatible TensorFlow ops. This includes control flow like if, for, while.
+  * TensorFlow ops like tf.cond and tf.while_loop continue to work, but control flow is often easier to write and understand when written in Python.
+  * AutoGraph will convert some if <condition> statements into the equivalent tf.cond calls. This substitution is made if <condition> is a Tensor. Otherwise, the if statement is executed as a Python conditional.
+  * AutoGraph will convert some for and while statements into the equivalent TensorFlow looping ops, like tf.while_loop. If not converted, the for or while loop is executed as a Python loop.
+ 
 
  
 
